@@ -1,5 +1,5 @@
 {
-  "name": "@dank074/discord-video-stream",
+  "name": "@mairee/discord-video-stream",
   "version": "3.2.0",
   "description": "Experiment for making video streaming work for discord selfbots",
   "exports": "./dist/index.js",
@@ -51,12 +51,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dank074/Discord-video-stream.git"
+    "url": "git+https://github.com/mairee/Discord-video-stream.git"
   },
   "author": "dank074",
   "license": "ISC",
   "bugs": {
-    "url": "https://github.com/dank074/Discord-video-stream/issues"
+    "url": "https://github.com/mairee/Discord-video-stream/issues"
   },
-  "homepage": "https://github.com/dank074/Discord-video-stream#readme"
+  "homepage": "https://github.com/mairee/Discord-video-stream#readme"
 }
