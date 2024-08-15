@@ -48,7 +48,7 @@ export function streamLivestreamVideo(input: string | Readable, mediaUdp: MediaU
 
         try {
             const command = ffmpeg(input)
-                .addOption('-loglevel', '0')
+                .addOption('-vf subtitles=./subtitle.srt')
                 .addOption('-fflags', 'nobuffer')
                 .addOption('-analyzeduration', '0')
                 .on('end', () => {
