@@ -3,7 +3,7 @@ name: Publish to npm
 on:
   push:
     branches:
-      - main # Change this if your default branch has a different name
+      - master # Change this if your default branch has a different name
   workflow_dispatch: # Allows manual triggering
 
 jobs:
