@@ -273,14 +273,10 @@ export function prepareStream(
     const outputArgs: string[] = [];
     for (let i = 0; i < mergedOptions.additionalArgs.length; i++) {
       const arg = mergedOptions.additionalArgs[i];
-      if (arg === "-ss" || arg.startsWith("-reconnect")) {
-        inputArgs.push(arg);
-        if (arg === "-ss" && i + 1 < mergedOptions.additionalArgs.length) {
-          inputArgs.push(mergedOptions.additionalArgs[i + 1]);
-          i++;
-        }
+      if (arg.startsWith("--output ")) {
+        outputArgs.push(arg.replace("--output ", ""));
       } else {
-        outputArgs.push(arg);
+        inputArgs.push(arg);
       }
     }
     if (inputArgs.length > 0) {
