@@ -287,7 +287,7 @@ export function prepareStream(
       command.inputOptions(inputArgs);
     }
     if (outputArgs.length > 0) {
-      command.addOutputOption(...outputArgs);
+      command.outputOptions(outputArgs);
     }
   }
 
