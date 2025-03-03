@@ -85,9 +85,14 @@ export type EncoderOptions = {
   customHeaders: Record<string, string>;
 
   /**
-   * Additional ffmpeg arguments. These will be split into input and output options.
+   * Additional ffmpeg input options.
    */
-  additionalArgs: string[];
+  inputAdditionalArgs: string[];
+
+  /**
+   * Additional ffmpeg output options.
+   */
+  outputAdditionalArgs: string[];
 };
 
 export function prepareStream(
@@ -115,7 +120,8 @@ export function prepareStream(
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.3",
       Connection: "keep-alive",
     },
-    additionalArgs: [],
+    inputAdditionalArgs: [],
+    outputAdditionalArgs: [],
   };
 
   function mergeOptions(opts: Partial<EncoderOptions>): EncoderOptions {
@@ -151,7 +157,10 @@ export function prepareStream(
       minimizeLatency: opts.minimizeLatency ?? defaultOptions.minimizeLatency,
       h26xPreset: opts.h26xPreset ?? defaultOptions.h26xPreset,
       customHeaders: { ...defaultOptions.customHeaders, ...opts.customHeaders },
-      additionalArgs: opts.additionalArgs || defaultOptions.additionalArgs,
+      inputAdditionalArgs:
+        opts.inputAdditionalArgs || defaultOptions.inputAdditionalArgs,
+      outputAdditionalArgs:
+        opts.outputAdditionalArgs || defaultOptions.outputAdditionalArgs,
     };
   }
 
@@ -267,24 +276,18 @@ export function prepareStream(
       .audioCodec("libopus")
       .audioBitrate(`${bitrateAudio}k`);
 
-  // Process additionalArgs: split into input and output options.
-  if (mergedOptions.additionalArgs && mergedOptions.additionalArgs.length > 0) {
-    const inputArgs: string[] = [];
-    const outputArgs: string[] = [];
-    for (let i = 0; i < mergedOptions.additionalArgs.length; i++) {
-      const arg = mergedOptions.additionalArgs[i];
-      if (arg.startsWith("--output ")) {
-        outputArgs.push(arg.replace("--output ", ""));
-      } else {
-        inputArgs.push(arg);
-      }
-    }
-    if (inputArgs.length > 0) {
-      command.inputOptions(inputArgs);
-    }
-    if (outputArgs.length > 0) {
-      command.outputOptions(outputArgs);
-    }
+  // Process additional input and output arguments.
+  if (
+    mergedOptions.inputAdditionalArgs &&
+    mergedOptions.inputAdditionalArgs.length > 0
+  ) {
+    command.inputOptions(mergedOptions.inputAdditionalArgs);
+  }
+  if (
+    mergedOptions.outputAdditionalArgs &&
+    mergedOptions.outputAdditionalArgs.length > 0
+  ) {
+    command.addOutputOption(...mergedOptions.outputAdditionalArgs);
   }
 
   // Exit handling.
