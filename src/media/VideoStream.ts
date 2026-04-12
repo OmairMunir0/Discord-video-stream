@@ -1,15 +1,17 @@
-import type { MediaUdp } from "../client/voice/MediaUdp.js";
 import { BaseMediaStream } from "./BaseMediaStream.js";
+import type { WebRtcConnWrapper } from "../client/voice/WebRtcWrapper.js";
 
 export class VideoStream extends BaseMediaStream {
-    public udp: MediaUdp;
+  private _conn: WebRtcConnWrapper;
+  constructor(conn: WebRtcConnWrapper, noSleep = false) {
+    super("video", noSleep);
+    this._conn = conn;
+  }
 
-    constructor(udp: MediaUdp, noSleep = false) {
-        super("video", noSleep);
-        this.udp = udp;
-    }
-
-    protected override async _sendFrame(frame: Buffer, frametime: number): Promise<void> {
-        await this.udp.sendVideoFrame(frame, frametime);
-    }
+  protected override async _sendFrame(
+    frame: Buffer,
+    frametime: number,
+  ): Promise<void> {
+    this._conn.sendVideoFrame(frame, frametime);
+  }
 }

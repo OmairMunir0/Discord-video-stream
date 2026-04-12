@@ -2,6 +2,7 @@ import { EventEmitter } from "node:events";
 import { VoiceConnection } from "./voice/VoiceConnection.js";
 import { StreamConnection } from "./voice/StreamConnection.js";
 import { GatewayOpCodes } from "./GatewayOpCodes.js";
+<<<<<<< HEAD
 import type TypedEmitter from "typed-emitter";
 import type { Client } from "discord.js-selfbot-v13";
 import type { MediaUdp } from "./voice/MediaUdp.js";
@@ -23,10 +24,22 @@ export type StreamerOptions = {
    */
   rtcpSenderReportEnabled: boolean;
 };
+=======
+import type {
+  Client,
+  DMChannel,
+  GroupDMChannel,
+  VoiceBasedChannel,
+} from "discord.js-selfbot-v13";
+import type { GatewayEvent, GatewayEventMap } from "./GatewayEvents.js";
+import type { WebRtcConnWrapper } from "./voice/WebRtcWrapper.js";
+import { generateStreamKey, parseStreamKey } from "../utils.js";
+>>>>>>> upstream/master
 
 export class Streamer {
   private _voiceConnection?: VoiceConnection;
   private _client: Client;
+<<<<<<< HEAD
   private _opts: StreamerOptions;
   private _gatewayEmitter =
     new EventEmitter() as TypedEmitter.default<EmitterEvents>;
@@ -38,6 +51,12 @@ export class Streamer {
       rtcpSenderReportEnabled: true,
       ...opts,
     };
+=======
+  private _gatewayEmitter = new EventEmitter<GatewayEventMap>();
+
+  constructor(client: Client) {
+    this._client = client;
+>>>>>>> upstream/master
 
     //listen for messages
     this.client.on("raw", (packet: GatewayEvent) => {
@@ -45,6 +64,7 @@ export class Streamer {
       this._gatewayEmitter.emit(packet.t, packet.d);
     });
   }
+<<<<<<< HEAD
 
   public get client(): Client {
     return this._client;
@@ -67,10 +87,93 @@ export class Streamer {
 
   public joinVoice(guild_id: string, channel_id: string): Promise<MediaUdp> {
     return new Promise<MediaUdp>((resolve, reject) => {
+=======
+
+  public get client(): Client {
+    return this._client;
+  }
+
+  public get opts() {
+    return {};
+  }
+
+  public get voiceConnection(): VoiceConnection | undefined {
+    return this._voiceConnection;
+  }
+
+  public sendOpcode(code: number, data: unknown): void {
+    this.client.ws.broadcast({
+      op: code,
+      d: data,
+    });
+  }
+
+  public joinVoiceChannel(
+    channel: DMChannel | GroupDMChannel | VoiceBasedChannel,
+  ): Promise<WebRtcConnWrapper> {
+    let guildId: string | null = null;
+
+    if (
+      channel.type === "GUILD_STAGE_VOICE" ||
+      channel.type === "GUILD_VOICE"
+    ) {
+      guildId = channel.guildId;
+    }
+
+    return this.joinVoice(guildId, channel.id);
+  }
+
+  /**
+   * Joins a voice channel and returns a WebRtcConnWrapper object.
+   * @param guild_id the guild id of the voice channel. If null, it will join a DM voice channel.
+   * @param channel_id the channel id of the voice channel
+   * @returns the WebRtcConnWrapper object
+   * @throws Error if the client is not logged in
+   */
+  public joinVoice(
+    guild_id: string | null,
+    channel_id: string,
+  ): Promise<WebRtcConnWrapper> {
+    return new Promise<WebRtcConnWrapper>((resolve, reject) => {
       if (!this.client.user) {
         reject("Client not logged in");
         return;
       }
+      const user_id = this.client.user.id;
+      const voiceConn = new VoiceConnection(
+        this,
+        guild_id,
+        user_id,
+        channel_id,
+        (conn) => {
+          resolve(conn);
+        },
+      );
+      this._voiceConnection = voiceConn;
+      this._gatewayEmitter.on("VOICE_STATE_UPDATE", (d) => {
+        if (user_id !== d.user_id) return;
+        voiceConn.setSession(d.session_id);
+      });
+      this._gatewayEmitter.on("VOICE_SERVER_UPDATE", (d) => {
+        if (guild_id !== d.guild_id) return;
+
+        // channel_id is not set for guild voice calls
+        if (d.channel_id && channel_id !== d.channel_id) return;
+
+        voiceConn.setTokens(d.endpoint, d.token);
+      });
+      this.signalVideo(false);
+    });
+  }
+
+  public createStream(): Promise<WebRtcConnWrapper> {
+    return new Promise<WebRtcConnWrapper>((resolve, reject) => {
+>>>>>>> upstream/master
+      if (!this.client.user) {
+        reject("Client not logged in");
+        return;
+      }
+<<<<<<< HEAD
       const user_id = this.client.user.id;
       const voiceConn = new VoiceConnection(
         this,
@@ -151,6 +254,68 @@ export class Streamer {
         streamConn.setTokens(d.endpoint, d.token);
       });
     });
+=======
+      if (!this.voiceConnection) {
+        reject("cannot start stream without first joining voice channel");
+        return;
+      }
+
+      this.signalStream();
+      const {
+        guildId: clientGuildId,
+        channelId: clientChannelId,
+        session_id,
+      } = this.voiceConnection;
+      const { id: clientUserId } = this.client.user;
+
+      if (!session_id) throw new Error("Session doesn't exist yet");
+      const streamConn = new StreamConnection(
+        this,
+        clientGuildId,
+        clientUserId,
+        clientChannelId,
+        (conn) => {
+          resolve(conn);
+        },
+      );
+      this.voiceConnection.streamConnection = streamConn;
+      this._gatewayEmitter.on("STREAM_CREATE", (d) => {
+        const { channelId, guildId, userId } = parseStreamKey(d.stream_key);
+
+        if (
+          clientGuildId !== guildId ||
+          clientChannelId !== channelId ||
+          clientUserId !== userId
+        )
+          return;
+
+        streamConn.serverId = d.rtc_server_id;
+        streamConn.streamKey = d.stream_key;
+        streamConn.setSession(session_id);
+      });
+      this._gatewayEmitter.on("STREAM_SERVER_UPDATE", (d) => {
+        const { channelId, guildId, userId } = parseStreamKey(d.stream_key);
+
+        if (
+          clientGuildId !== guildId ||
+          clientChannelId !== channelId ||
+          clientUserId !== userId
+        )
+          return;
+
+        streamConn.setTokens(d.endpoint, d.token);
+      });
+    });
+  }
+
+  public async setStreamPreview(image: Buffer): Promise<void> {
+    if (!this.client.token) throw new Error("Please login :)");
+    if (!this.voiceConnection?.streamConnection?.guildId) return;
+    const data = `data:image/jpeg;base64,${image.toString("base64")}`;
+    const { guildId } = this.voiceConnection.streamConnection;
+    const server = await this.client.guilds.fetch(guildId);
+    await server.members.me?.voice.postPreview(data);
+>>>>>>> upstream/master
   }
 
   public stopStream(): void {
@@ -181,7 +346,11 @@ export class Streamer {
     if (!this.voiceConnection) return;
     const { guildId: guild_id, channelId: channel_id } = this.voiceConnection;
     this.sendOpcode(GatewayOpCodes.VOICE_STATE_UPDATE, {
+<<<<<<< HEAD
       guild_id,
+=======
+      guild_id: guild_id,
+>>>>>>> upstream/master
       channel_id,
       self_mute: false,
       self_deaf: true,
@@ -192,10 +361,15 @@ export class Streamer {
   public signalStream(): void {
     if (!this.voiceConnection) return;
     const {
+<<<<<<< HEAD
+=======
+      type,
+>>>>>>> upstream/master
       guildId: guild_id,
       channelId: channel_id,
       botId: user_id,
     } = this.voiceConnection;
+<<<<<<< HEAD
     this.sendOpcode(GatewayOpCodes.STREAM_CREATE, {
       type: "guild",
       guild_id,
@@ -221,6 +395,39 @@ export class Streamer {
     });
   }
 
+=======
+
+    const streamKey = generateStreamKey(type, guild_id, channel_id, user_id);
+
+    this.sendOpcode(GatewayOpCodes.STREAM_CREATE, {
+      type,
+      guild_id,
+      channel_id,
+      preferred_region: null,
+    });
+
+    this.sendOpcode(GatewayOpCodes.STREAM_SET_PAUSED, {
+      stream_key: streamKey,
+      paused: false,
+    });
+  }
+
+  public signalStopStream(): void {
+    if (!this.voiceConnection) return;
+    const {
+      type,
+      guildId: guild_id,
+      channelId: channel_id,
+      botId: user_id,
+    } = this.voiceConnection;
+
+    const streamKey = generateStreamKey(type, guild_id, channel_id, user_id);
+    this.sendOpcode(GatewayOpCodes.STREAM_DELETE, {
+      stream_key: streamKey,
+    });
+  }
+
+>>>>>>> upstream/master
   public signalLeaveVoice(): void {
     this.sendOpcode(GatewayOpCodes.VOICE_STATE_UPDATE, {
       guild_id: null,

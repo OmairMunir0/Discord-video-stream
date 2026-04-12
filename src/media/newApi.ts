@@ -1,109 +1,142 @@
-import ffmpeg from "fluent-ffmpeg";
-import { demux } from "./LibavDemuxer.js";
+import pDebounce from "p-debounce";
+import sharp from "sharp";
+import Log from "debug-level";
+import { FFmpegCommand } from "fluent-ffmpeg-simplified";
+import { type Packet, AV_PKT_FLAG_KEY } from "node-av";
 import { PassThrough, type Readable } from "node:stream";
-import type { SupportedVideoCodec } from "../utils.js";
-import type { MediaUdp, Streamer } from "../client/index.js";
+import { demux } from "./LibavDemuxer.js";
 import { VideoStream } from "./VideoStream.js";
 import { AudioStream } from "./AudioStream.js";
-import { isFiniteNonZero } from "../utils.js";
+import { isBun, isDeno, isFiniteNonZero } from "../utils.js";
 import { AVCodecID } from "./LibavCodecId.js";
+import { createDecoder } from "./LibavDecoder.js";
+import { Encoders } from "./encoders/index.js";
 
-export type EncoderOptions = {
+import type { Request } from "zeromq";
+import type { SupportedVideoCodec } from "../utils.js";
+import type { Streamer } from "../client/index.js";
+import type { EncoderSettingsGetter } from "./encoders/index.js";
+import type { VideoStreamInfo } from "./LibavDemuxer.js";
+import type { WebRtcConnWrapper } from "../client/voice/WebRtcWrapper.js";
+
+export type PrepareStreamOptions = {
   /**
-   * Disable video transcoding.
+   * Disable video transcoding
+   * If enabled, all video related settings have no effects, and the input
+   * video stream is used as-is.
+   *
+   * You need to ensure that the video stream has the right properties
+   * (keyframe every 1s, B-frames disabled). Failure to do so will result in
+   * a glitchy stream, or degraded performance
    */
   noTranscoding: boolean;
 
   /**
-   * Video width.
+   * Video width
    */
   width: number;
 
   /**
-   * Video height.
+   * Video height
    */
   height: number;
 
   /**
-   * Video frame rate.
+   * Video frame rate
    */
   frameRate?: number;
 
   /**
-   * Video codec.
+   * Video codec
    */
   videoCodec: SupportedVideoCodec;
 
   /**
-   * Video average bitrate in kbps.
+   * Video average bitrate in kbps
    */
   bitrateVideo: number;
 
   /**
-   * Video max bitrate in kbps.
+   * Video max bitrate in kbps
    */
   bitrateVideoMax: number;
 
   /**
-   * Audio bitrate in kbps.
+   * Audio bitrate in kbps
    */
   bitrateAudio: number;
 
   /**
-   * Enable audio output.
+   * Enable audio output
    */
   includeAudio: boolean;
 
   /**
-   * Enable hardware accelerated decoding.
+   * Functions to get encoder settings
+   * This function will receive the average and max bitrate as the input, and
+   * returns an object containing encoder settings for the supported codecs
+   */
+  encoder: EncoderSettingsGetter;
+
+  /**
+   * Enable hardware accelerated decoding
    */
   hardwareAcceleratedDecoding: boolean;
 
   /**
-   * Add some options to minimize latency.
+   * Add some options to minimize latency
    */
   minimizeLatency: boolean;
 
   /**
-   * Preset for x264 and x265.
-   */
-  h26xPreset:
-    | "ultrafast"
-    | "superfast"
-    | "veryfast"
-    | "faster"
-    | "fast"
-    | "medium"
-    | "slow"
-    | "slower"
-    | "veryslow"
-    | "placebo";
-
-  /**
-   * Custom headers for HTTP requests.
+   * Custom headers for HTTP requests
    */
   customHeaders: Record<string, string>;
 
   /**
-   * Additional ffmpeg input options.
+   * Custom input options to pass directly to ffmpeg
+   * These will be added to the command before other options
    */
-  inputAdditionalArgs: string[];
+  customInputOptions: string[];
 
   /**
-   * Additional ffmpeg output options.
+   * Custom ffmpeg flags/options to pass directly to ffmpeg
+   * These will be added to the command after other options
    */
-  outputAdditionalArgs: string[];
+  customFfmpegFlags: string[];
+
+  /**
+   * FFmpeg log level
+   */
+  logLevel:
+    | "quiet"
+    | "panic"
+    | "fatal"
+    | "error"
+    | "warning"
+    | "info"
+    | "verbose"
+    | "debug"
+    | "trace";
+};
+
+export type Controller = {
+  volume: number;
+  setVolume(newVolume: number): Promise<boolean>;
 };
 
 export function prepareStream(
   input: string | Readable,
-  options: Partial<EncoderOptions> = {},
-  cancelSignal?: AbortSignal
+  options: Partial<PrepareStreamOptions> = {},
+  cancelSignal?: AbortSignal,
 ) {
   cancelSignal?.throwIfAborted();
-  const defaultOptions: EncoderOptions = {
+
+  const logger = new Log("prepareStream");
+  const loggerFFmpeg = new Log("prepareStream:ffmpeg");
+  const defaultOptions = {
     noTranscoding: false,
-    // Negative values mean “resize by aspect ratio”
+    // negative values = resize by aspect ratio, see https://trac.ffmpeg.org/wiki/Scaling
     width: -2,
     height: -2,
     frameRate: undefined,
@@ -112,85 +145,127 @@ export function prepareStream(
     bitrateVideoMax: 7000,
     bitrateAudio: 128,
     includeAudio: true,
+    encoder: Encoders.software(),
     hardwareAcceleratedDecoding: false,
     minimizeLatency: false,
-    h26xPreset: "ultrafast",
     customHeaders: {
       "User-Agent":
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.3",
       Connection: "keep-alive",
     },
-    inputAdditionalArgs: [],
-    outputAdditionalArgs: [],
-  };
+    customInputOptions: [],
+    customFfmpegFlags: [],
+    logLevel: "verbose",
+  } satisfies PrepareStreamOptions;
 
-  function mergeOptions(opts: Partial<EncoderOptions>): EncoderOptions {
+  function mergeOptions(opts: Partial<PrepareStreamOptions>) {
     return {
       noTranscoding: opts.noTranscoding ?? defaultOptions.noTranscoding,
+
       width: isFiniteNonZero(opts.width)
         ? Math.round(opts.width)
         : defaultOptions.width,
+
       height: isFiniteNonZero(opts.height)
         ? Math.round(opts.height)
         : defaultOptions.height,
+
       frameRate:
-        isFiniteNonZero(opts.frameRate) && opts.frameRate! > 0
+        isFiniteNonZero(opts.frameRate) && opts.frameRate > 0
           ? opts.frameRate
           : defaultOptions.frameRate,
+
       videoCodec: opts.videoCodec ?? defaultOptions.videoCodec,
+
       bitrateVideo:
-        isFiniteNonZero(opts.bitrateVideo) && opts.bitrateVideo! > 0
-          ? Math.round(opts.bitrateVideo!)
+        isFiniteNonZero(opts.bitrateVideo) && opts.bitrateVideo > 0
+          ? Math.round(opts.bitrateVideo)
           : defaultOptions.bitrateVideo,
+
       bitrateVideoMax:
-        isFiniteNonZero(opts.bitrateVideoMax) && opts.bitrateVideoMax! > 0
-          ? Math.round(opts.bitrateVideoMax!)
+        isFiniteNonZero(opts.bitrateVideoMax) && opts.bitrateVideoMax > 0
+          ? Math.round(opts.bitrateVideoMax)
           : defaultOptions.bitrateVideoMax,
+
       bitrateAudio:
-        isFiniteNonZero(opts.bitrateAudio) && opts.bitrateAudio! > 0
-          ? Math.round(opts.bitrateAudio!)
+        isFiniteNonZero(opts.bitrateAudio) && opts.bitrateAudio > 0
+          ? Math.round(opts.bitrateAudio)
           : defaultOptions.bitrateAudio,
+
+      encoder: opts.encoder ?? defaultOptions.encoder,
+
       includeAudio: opts.includeAudio ?? defaultOptions.includeAudio,
+
       hardwareAcceleratedDecoding:
         opts.hardwareAcceleratedDecoding ??
         defaultOptions.hardwareAcceleratedDecoding,
+
       minimizeLatency: opts.minimizeLatency ?? defaultOptions.minimizeLatency,
-      h26xPreset: opts.h26xPreset ?? defaultOptions.h26xPreset,
-      customHeaders: { ...defaultOptions.customHeaders, ...opts.customHeaders },
-      inputAdditionalArgs:
-        opts.inputAdditionalArgs || defaultOptions.inputAdditionalArgs,
-      outputAdditionalArgs:
-        opts.outputAdditionalArgs || defaultOptions.outputAdditionalArgs,
-    };
+
+      customHeaders: {
+        ...defaultOptions.customHeaders,
+        ...opts.customHeaders,
+      },
+
+      customInputOptions:
+        opts.customInputOptions ?? defaultOptions.customInputOptions,
+
+      customFfmpegFlags:
+        opts.customFfmpegFlags ?? defaultOptions.customFfmpegFlags,
+
+      logLevel: opts.logLevel ?? defaultOptions.logLevel,
+    } satisfies PrepareStreamOptions;
   }
 
   const mergedOptions = mergeOptions(options);
 
   let isHttpUrl = false;
   let isHls = false;
+  let isSrt = false;
+
   if (typeof input === "string") {
     isHttpUrl = input.startsWith("http") || input.startsWith("https");
     isHls = input.includes("m3u");
+    isSrt = input.startsWith("srt://");
   }
 
   const output = new PassThrough();
 
-  // Command creation.
-  const command = ffmpeg(input).addOption("-loglevel", "0");
+  // command creation
+  const command = new FFmpegCommand();
+  command.on("stderr", (line) => {
+    loggerFFmpeg.debug(line);
+  });
+  command.input(input);
+  command.inputOptions("-y", "-loglevel", mergedOptions.logLevel, "-nostats");
 
-  // Input options.
+  // input options
+  if (
+    mergedOptions.customInputOptions &&
+    mergedOptions.customInputOptions.length > 0
+  ) {
+    command.inputOptions(mergedOptions.customInputOptions);
+  }
+
   const { hardwareAcceleratedDecoding, minimizeLatency, customHeaders } =
     mergedOptions;
-  if (hardwareAcceleratedDecoding) command.inputOption("-hwaccel", "auto");
+  if (hardwareAcceleratedDecoding) command.inputOptions("-hwaccel", "auto");
+
   if (minimizeLatency) {
-    command.addOptions(["-fflags nobuffer", "-analyzeduration 0"]);
+    command.inputOptions(
+      "-fflags nobuffer",
+      "-flags lowdelay",
+      "-flush_packets 1",
+      "-max_delay 100000",
+    );
   }
+
   if (isHttpUrl) {
-    command.inputOption(
+    command.inputOptions(
       "-headers",
       Object.entries(customHeaders)
         .map(([k, v]) => `${k}: ${v}`)
-        .join("\r\n")
+        .join("\r\n"),
     );
     if (!isHls) {
       command.inputOptions([
@@ -202,10 +277,14 @@ export function prepareStream(
     }
   }
 
-  // General output options.
-  command.output(output).outputFormat("matroska");
+  if (isSrt) {
+    command.inputOptions("-scan_all_pmts 0");
+  }
 
-  // Video setup.
+  // general output options
+  command.output(output).format("nut");
+
+  // video setup
   const {
     noTranscoding,
     width,
@@ -214,19 +293,24 @@ export function prepareStream(
     bitrateVideo,
     bitrateVideoMax,
     videoCodec,
-    h26xPreset,
+    encoder,
   } = mergedOptions;
-  command.addOutputOption("-map 0:v");
+  command.outputOptions("-map 0:v");
+
   if (noTranscoding) {
     command.videoCodec("copy");
   } else {
-    command.videoFilter(`scale=${width}:${height}`);
-    if (frameRate) command.fpsOutput(frameRate);
-    command.addOutputOption([
+    command.videoFilters(`scale=${width}:${height}`);
+
+    if (frameRate) command.fps(frameRate);
+
+    command.outputOptions([
       "-b:v",
       `${bitrateVideo}k`,
       "-maxrate:v",
       `${bitrateVideoMax}k`,
+      "-bufsize:v",
+      `${Math.round(bitrateVideo / 2)}k`,
       "-bf",
       "0",
       "-pix_fmt",
@@ -234,120 +318,212 @@ export function prepareStream(
       "-force_key_frames",
       "expr:gte(t,n_forced*1)",
     ]);
-    switch (videoCodec) {
-      case "AV1":
-        command.videoCodec("libsvtav1");
-        break;
-      case "VP8":
-        command.videoCodec("libvpx").outputOption("-deadline", "realtime");
-        break;
-      case "VP9":
-        command.videoCodec("libvpx-vp9").outputOption("-deadline", "realtime");
-        break;
-      case "H264":
-        command
-          .videoCodec("libx264")
-          .outputOptions([
-            "-tune zerolatency",
-            `-preset ${h26xPreset}`,
-            "-profile:v baseline",
-          ]);
-        break;
-      case "H265":
-        command
-          .videoCodec("libx265")
-          .outputOptions([
-            "-tune zerolatency",
-            `-preset ${h26xPreset}`,
-            "-profile:v main",
-          ]);
-        break;
-    }
+
+    const encoderSettings = encoder(bitrateVideo, bitrateVideoMax)[videoCodec];
+    if (!encoderSettings)
+      throw new Error(`Encoder settings not specified for ${videoCodec}`);
+    command
+      .videoCodec(encoderSettings.name)
+      .videoFilters(encoderSettings.outFilters ?? [])
+      .outputOptions(encoderSettings.options)
+      .outputOptions(encoderSettings.globalOptions ?? []);
   }
 
-  // Audio setup.
+  // audio setup
   const { includeAudio, bitrateAudio } = mergedOptions;
   if (includeAudio)
     command
-      .addOutputOption("-map 0:a?")
+      .outputOptions("-map 0:a:0?")
       .audioChannels(2)
-      .addOutputOption("-lfe_mix_level 1")
+      /*
+       * I don't have much surround sound material to test this with,
+       * if you do and you have better settings for this, feel free to
+       * contribute!
+       */
+      .outputOptions("-lfe_mix_level 1")
       .audioFrequency(48000)
       .audioCodec("libopus")
-      .audioBitrate(`${bitrateAudio}k`);
+      .audioBitrate(`${bitrateAudio}k`)
+      .audioFilters("volume@internal_lib=1.0");
 
-  // Process additional input and output arguments.
+  // Add custom ffmpeg flags
   if (
-    mergedOptions.inputAdditionalArgs &&
-    mergedOptions.inputAdditionalArgs.length > 0
+    mergedOptions.customFfmpegFlags &&
+    mergedOptions.customFfmpegFlags.length > 0
   ) {
-    command.inputOptions(mergedOptions.inputAdditionalArgs);
-  }
-  if (
-    mergedOptions.outputAdditionalArgs &&
-    mergedOptions.outputAdditionalArgs.length > 0
-  ) {
-    command.addOutputOption(...mergedOptions.outputAdditionalArgs);
+    command.outputOptions(mergedOptions.customFfmpegFlags);
   }
 
-  // Exit handling.
-  const promise = new Promise<void>((resolve, reject) => {
-    command.on("error", (err) => {
-      if (cancelSignal?.aborted) reject(cancelSignal.reason);
-      else reject(err);
+  // realtime control mechanism
+  let currentVolume = 1;
+  let zmqClientPromise: Promise<Request> | undefined;
+  if (includeAudio && !isBun() && !isDeno()) {
+    function randomInclusive(start: number, end: number) {
+      return Math.floor(Math.random() * (end - start + 1)) + start;
+    }
+    // Last octet is from 2 to 254 to avoid WSL2 shenanigans
+    const loopbackIp = [
+      127,
+      randomInclusive(0, 255),
+      randomInclusive(0, 255),
+      randomInclusive(2, 254),
+    ].join(".");
+    const zmqEndpoint = `tcp://${loopbackIp}:42069`;
+    command.audioFilters(`azmq=b=${zmqEndpoint.replaceAll(":", "\\\\:")}`);
+    zmqClientPromise = import("zeromq").then((zmq) => {
+      const client = new zmq.Request({
+        sendTimeout: 5000,
+        receiveTimeout: 5000,
+      });
+      client.connect(zmqEndpoint);
+      promise.catch(() => {}).finally(() => client.disconnect(zmqEndpoint));
+      return client;
     });
-    command.on("end", () => resolve());
-  });
-  promise.catch(() => {});
-  cancelSignal?.addEventListener("abort", () => command.kill("SIGTERM"), {
-    once: true,
-  });
-  command.run();
+  }
 
-  return { command, output, promise };
+  command.once("start", (cmdline) => {
+    logger.debug(`Starting ffmpeg: ${cmdline}`);
+  });
+  const promise = command.run(cancelSignal);
+
+  return {
+    command,
+    output,
+    promise: promise as Promise<unknown>,
+    controller: {
+      get volume() {
+        return currentVolume;
+      },
+      async setVolume(newVolume: number) {
+        if (newVolume < 0) return false;
+        try {
+          if (!zmqClientPromise) return false;
+          const client = await zmqClientPromise;
+          await client.send(`volume@internal_lib volume ${newVolume}`);
+          const [res] = await client.receive();
+          if (res.toString("utf-8").split(" ")[0] !== "0") return false;
+          currentVolume = newVolume;
+          return true;
+        } catch {
+          return false;
+        }
+      },
+    } satisfies Controller,
+  };
 }
 
 export type PlayStreamOptions = {
   /**
-   * Set stream type as "Go Live" or camera stream.
+   * Set stream type as "Go Live" or camera stream
    */
   type: "go-live" | "camera";
+
+  /**
+   * Set format of the stream
+   */
+  format: "matroska" | "nut";
+
   /**
    * Override video width sent to Discord.
+   *
    * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
    */
-  width: number;
+  width: number | ((v: VideoStreamInfo) => number);
+
   /**
    * Override video height sent to Discord.
+   *
    * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
    */
-  height: number;
+  height: number | ((v: VideoStreamInfo) => number);
+
   /**
    * Override video frame rate sent to Discord.
+   *
    * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
    */
-  frameRate: number;
+  frameRate: number | ((v: VideoStreamInfo) => number);
+
   /**
-   * Same as ffmpeg's `readrate_initial_burst` command line flag.
+   * Same as ffmpeg's `readrate_initial_burst` command line flag
+   *
    * See https://ffmpeg.org/ffmpeg.html#:~:text=%2Dreadrate_initial_burst
    */
   readrateInitialBurst: number | undefined;
+
+  /**
+   * Enable stream preview from input stream (experimental)
+   */
+  streamPreview: boolean;
 };
 
 export async function playStream(
   input: Readable,
   streamer: Streamer,
   options: Partial<PlayStreamOptions> = {},
-  cancelSignal?: AbortSignal
+  cancelSignal?: AbortSignal,
 ) {
+  const logger = new Log("playStream");
   cancelSignal?.throwIfAborted();
   if (!streamer.voiceConnection)
     throw new Error("Bot is not connected to a voice channel");
 
-  const { video, audio } = await demux(input);
+  const defaultOptions = {
+    type: "go-live",
+    format: "nut",
+    width: (video) => video.width,
+    height: (video) => video.height,
+    frameRate: (video) => video.framerate_num / video.framerate_den,
+    readrateInitialBurst: undefined,
+    streamPreview: false,
+  } satisfies PlayStreamOptions;
+
+  function mergeOptions(opts: Partial<PlayStreamOptions>) {
+    return {
+      type: opts.type ?? defaultOptions.type,
+
+      format: opts.format ?? defaultOptions.format,
+
+      width:
+        typeof opts.width === "function" ||
+        (isFiniteNonZero(opts.width) && opts.width > 0)
+          ? opts.width
+          : defaultOptions.width,
+
+      height:
+        typeof opts.height === "function" ||
+        (isFiniteNonZero(opts.height) && opts.height > 0)
+          ? opts.height
+          : defaultOptions.height,
+
+      frameRate:
+        typeof opts.frameRate === "function" ||
+        (isFiniteNonZero(opts.frameRate) && opts.frameRate > 0)
+          ? opts.frameRate
+          : defaultOptions.frameRate,
+
+      readrateInitialBurst:
+        isFiniteNonZero(opts.readrateInitialBurst) &&
+        opts.readrateInitialBurst > 0
+          ? opts.readrateInitialBurst
+          : defaultOptions.readrateInitialBurst,
+
+      streamPreview: opts.streamPreview ?? defaultOptions.streamPreview,
+    } satisfies PlayStreamOptions;
+  }
+
+  const mergedOptions = mergeOptions(options);
+  logger.debug({ options: mergedOptions }, "Merged options");
+
+  logger.debug("Initializing demuxer");
+  const { video, audio } = await demux(input, {
+    format: mergedOptions.format,
+  });
   cancelSignal?.throwIfAborted();
+
   if (!video) throw new Error("No video stream in media");
 
+  const cleanupFuncs: (() => unknown)[] = [];
   const videoCodecMap: Record<number, SupportedVideoCodec> = {
     [AVCodecID.AV_CODEC_ID_H264]: "H264",
     [AVCodecID.AV_CODEC_ID_H265]: "H265",
@@ -356,85 +532,109 @@ export async function playStream(
     [AVCodecID.AV_CODEC_ID_AV1]: "AV1",
   };
 
-  const defaultOptions: PlayStreamOptions = {
-    type: "go-live",
-    width: video.width,
-    height: video.height,
-    frameRate: video.framerate_num / video.framerate_den,
-    readrateInitialBurst: undefined,
-  };
-
-  function mergeOptions(opts: Partial<PlayStreamOptions>): PlayStreamOptions {
-    return {
-      type: opts.type ?? defaultOptions.type,
-      width:
-        isFiniteNonZero(opts.width) && opts.width! > 0
-          ? Math.round(opts.width!)
-          : defaultOptions.width,
-      height:
-        isFiniteNonZero(opts.height) && opts.height! > 0
-          ? Math.round(opts.height!)
-          : defaultOptions.height,
-      frameRate: Math.round(
-        isFiniteNonZero(opts.frameRate) && opts.frameRate! > 0
-          ? Math.round(opts.frameRate!)
-          : defaultOptions.frameRate
-      ),
-      readrateInitialBurst:
-        isFiniteNonZero(opts.readrateInitialBurst) &&
-        opts.readrateInitialBurst! > 0
-          ? opts.readrateInitialBurst
-          : defaultOptions.readrateInitialBurst,
-    };
-  }
-
-  const mergedOptions = mergeOptions(options);
-
-  let udp: MediaUdp;
+  let conn: WebRtcConnWrapper;
   let stopStream: () => unknown;
   if (mergedOptions.type === "go-live") {
-    udp = await streamer.createStream();
+    conn = await streamer.createStream();
     stopStream = () => streamer.stopStream();
   } else {
-    udp = streamer.voiceConnection.udp;
+    conn = streamer.voiceConnection.webRtcConn;
     streamer.signalVideo(true);
     stopStream = () => streamer.signalVideo(false);
   }
-
-  udp.setPacketizer(videoCodecMap[video.codec]);
-  udp.mediaConnection.setSpeaking(true);
-  udp.mediaConnection.setVideoAttributes(true, {
-    width: mergedOptions.width,
-    height: mergedOptions.height,
-    fps: mergedOptions.frameRate,
+  conn.setPacketizer(videoCodecMap[video.codec]);
+  conn.mediaConnection.setSpeaking(true);
+  const { width, height, frameRate } = mergedOptions;
+  conn.mediaConnection.setVideoAttributes(true, {
+    width: Math.round(typeof width === "function" ? width(video) : width),
+    height: Math.round(typeof height === "function" ? height(video) : height),
+    fps: Math.round(
+      typeof frameRate === "function" ? frameRate(video) : frameRate,
+    ),
   });
 
-  const vStream = new VideoStream(udp);
+  const vStream = new VideoStream(conn);
   video.stream.pipe(vStream);
   if (audio) {
-    const aStream = new AudioStream(udp);
+    const aStream = new AudioStream(conn);
     audio.stream.pipe(aStream);
     vStream.syncStream = aStream;
-    aStream.syncStream = vStream;
+
     const burstTime = mergedOptions.readrateInitialBurst;
     if (typeof burstTime === "number") {
-      vStream.sync = aStream.sync = false;
+      vStream.sync = false;
       vStream.noSleep = aStream.noSleep = true;
       const stopBurst = (pts: number) => {
         if (pts < burstTime * 1000) return;
-        vStream.sync = aStream.sync = true;
+        vStream.sync = true;
         vStream.noSleep = aStream.noSleep = false;
         vStream.off("pts", stopBurst);
       };
       vStream.on("pts", stopBurst);
     }
   }
+  if (mergedOptions.streamPreview && mergedOptions.type === "go-live") {
+    (async () => {
+      const logger = new Log("playStream:preview");
+      logger.debug("Initializing decoder for stream preview");
+      const decoder = await createDecoder(video.avStream);
+      if (!decoder) {
+        logger.warn(
+          "Failed to initialize decoder. Stream preview will be disabled",
+        );
+        return;
+      }
+      cleanupFuncs.push(() => {
+        logger.debug("Freeing decoder");
+        decoder.free();
+      });
+      const updatePreview = pDebounce.promise(async (packet: Packet) => {
+        if (!(packet.flags !== undefined && packet.flags & AV_PKT_FLAG_KEY))
+          return;
+        const decodeStart = performance.now();
+        const frames = await decoder.decode(packet).catch((e) => {
+          logger.error(e, "Failed to decode the frame");
+          return [];
+        });
+        if (!frames.length) return;
 
-  return new Promise<void>((resolve, reject) => {
-    const cleanup = () => {
+        const decodeEnd = performance.now();
+        logger.debug(`Decoding a frame took ${decodeEnd - decodeStart}ms`);
+        const frame = frames[0];
+
+        return sharp(frame.toBuffer(), {
+          raw: {
+            width: frame.width ?? 0,
+            height: frame.height ?? 0,
+            channels: 4,
+          },
+        })
+          .resize(1024, 576, { fit: "inside" })
+          .jpeg()
+          .toBuffer()
+          .then((image) => streamer.setStreamPreview(image))
+          .catch(() => {})
+          .finally(() => {
+            frames.forEach((frame) => {
+              frame.free();
+            });
+          });
+      });
+      video.stream.on("data", updatePreview);
+      cleanupFuncs.push(() => video.stream.off("data", updatePreview));
+    })();
+  }
+  const promise = new Promise<void>((resolve, reject) => {
+    cleanupFuncs.push(() => {
       stopStream();
-      udp.mediaConnection.setSpeaking(false);
-      udp.mediaConnection.setVideoAttributes(false);
+      conn.mediaConnection.setSpeaking(false);
+      conn.mediaConnection.setVideoAttributes(false);
+    });
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      for (const f of cleanupFuncs) f();
     };
     cancelSignal?.addEventListener(
       "abort",
@@ -442,12 +642,14 @@ export async function playStream(
         cleanup();
         reject(cancelSignal.reason);
       },
-      { once: true }
+      { once: true },
     );
     vStream.once("finish", () => {
       if (cancelSignal?.aborted) return;
       cleanup();
       resolve();
     });
-  }).catch(() => {});
+  });
+  promise.catch(() => {});
+  return promise;
 }

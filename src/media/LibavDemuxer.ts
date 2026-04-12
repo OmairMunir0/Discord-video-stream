@@ -1,343 +1,291 @@
-import LibAV from "@libav.js/variant-webcodecs";
 import pDebounce from "p-debounce";
-import { Log } from "debug-level";
-import { uid } from "uid";
-import { AVCodecID } from "./LibavCodecId.js";
 import {
-    H264Helpers, H264NalUnitTypes,
-    H265Helpers, H265NalUnitTypes,
-    splitNalu, mergeNalu
-} from "../client/processing/AnnexBHelper.js";
+  BitStreamFilterAPI,
+  Demuxer,
+  avGetCodecName,
+  type Stream,
+} from "node-av";
+import { Log } from "debug-level";
+import { randomUUID } from "node:crypto";
+import { AVCodecID } from "./LibavCodecId.js";
 import { PassThrough } from "node:stream";
+import type { CodecParameters, Packet } from "node-av";
 import type { Readable } from "node:stream";
 
 type MediaStreamInfoCommon = {
-    index: number,
-    codec: AVCodecID,
-}
-type VideoStreamInfo = MediaStreamInfoCommon & {
-    width: number,
-    height: number,
-    framerate_num: number,
-    framerate_den: number,
-    extradata?: unknown
-}
-type AudioStreamInfo = MediaStreamInfoCommon & {
-    sample_rate: number
+  index: number;
+  codec: AVCodecID;
+  codecpar: CodecParameters;
+  avStream: Stream;
 };
 
-type H264ParamSets = Record<"sps" | "pps", Buffer[]>
-type H265ParamSets = Record<"vps" | "sps" | "pps", Buffer[]>
+export type VideoStreamInfo = MediaStreamInfoCommon & {
+  width: number;
+  height: number;
+  framerate_num: number;
+  framerate_den: number;
+};
+export type AudioStreamInfo = MediaStreamInfoCommon & {
+  sample_rate: number;
+};
 
 const allowedVideoCodec = new Set([
-    AVCodecID.AV_CODEC_ID_H264,
-    AVCodecID.AV_CODEC_ID_H265,
-    AVCodecID.AV_CODEC_ID_VP8,
-    AVCodecID.AV_CODEC_ID_VP9,
-    AVCodecID.AV_CODEC_ID_AV1
+  AVCodecID.AV_CODEC_ID_H264,
+  AVCodecID.AV_CODEC_ID_H265,
+  AVCodecID.AV_CODEC_ID_VP8,
+  AVCodecID.AV_CODEC_ID_VP9,
+  AVCodecID.AV_CODEC_ID_AV1,
 ]);
 
-const allowedAudioCodec = new Set([
-    AVCodecID.AV_CODEC_ID_OPUS
-]);
+const allowedAudioCodec = new Set([AVCodecID.AV_CODEC_ID_OPUS]);
 
-// Parse the avcC atom, which contains SPS and PPS
-function parseavcC(input: Buffer) {
-    let buf = input;
-    if (buf[0] !== 1)
-        throw new Error("Only configurationVersion 1 is supported");
-    // Skip a bunch of stuff we don't care about
-    buf = buf.subarray(5);
+function parseOpusPacketDuration(frame: Uint8Array) {
+  // https://datatracker.ietf.org/doc/html/rfc6716#section-3.1
+  const frameSizes = [
+    // SILK only, narrow band
+    10, 20, 40, 60,
 
-    const sps: Buffer[] = [];
-    const pps: Buffer[] = [];
+    // SILK only, medium band
+    10, 20, 40, 60,
 
-    // Read the SPS
-    const spsCount = buf[0] & 0b11111;
-    buf = buf.subarray(1);
-    for (let i = 0; i < spsCount; ++i) {
-        const spsLength = buf.readUInt16BE();
-        buf = buf.subarray(2);
-        sps.push(buf.subarray(0, spsLength));
-        buf = buf.subarray(spsLength);
-    }
+    // SILK only, wide band
+    10, 20, 40, 60,
 
-    // Read the PPS
-    const ppsCount = buf[0];
-    buf = buf.subarray(1);
-    for (let i = 0; i < ppsCount; ++i) {
-        const ppsLength = buf.readUInt16BE();
-        buf = buf.subarray(2);
-        pps.push(buf.subarray(0, ppsLength));
-        buf = buf.subarray(ppsLength);
-    }
-    return { sps, pps }
+    // Hybrid, super wide band
+    10, 20,
+
+    // Hybrid, full band
+    10, 20,
+
+    // CELT only, narrow band
+    2.5, 5, 10, 20,
+
+    // CELT only, wide band
+    2.5, 5, 10, 20,
+
+    // CELT only, super wide band
+    2.5, 5, 10, 20,
+
+    // CELT only, full band
+    2.5, 5, 10, 20,
+  ];
+
+  const frameSize = (48000 / 1000) * frameSizes[frame[0] >> 3];
+
+  let frameCount = 0;
+  const c = frame[0] & 0b11;
+  switch (c) {
+    case 0:
+      frameCount = 1;
+      break;
+
+    case 1:
+    case 2:
+      frameCount = 2;
+      break;
+
+    case 3:
+      frameCount = frame[1] & 0b111111;
+      break;
+  }
+
+  return frameSize * frameCount;
 }
 
-// Parse the hvcC atom, which contains VPS, SPS, PPS
-function parsehvcC(input: Buffer) {
-    let buf = input;
-    if (buf[0] !== 1)
-        throw new Error("Only configurationVersion 1 is supported");
-    // Skip a bunch of stuff we don't care about
-    buf = buf.subarray(22);
+type DemuxerOptions = {
+  format: "matroska" | "nut";
+};
 
-    const vps: Buffer[] = [];
-    const sps: Buffer[] = [];
-    const pps: Buffer[] = [];
+export async function demux(input: Readable, { format }: DemuxerOptions) {
+  const loggerFormat = new Log("demux:format");
+  const loggerFrameCommon = new Log("demux:frame:common");
+  const loggerFrameVideo = new Log("demux:frame:video");
+  const loggerFrameAudio = new Log("demux:frame:audio");
 
-    const numOfArrays = buf[0];
-    buf = buf.subarray(1);
+  const filename = randomUUID();
+  const demuxer = await Demuxer.open(input, {
+    options: {
+      fflags: "nobuffer",
+    },
+    format,
+    bufferSize: 8192,
+  });
 
-    for (let i = 0; i < numOfArrays; ++i) {
-        const naluType = buf[0] & 0b111111;
-        buf = buf.subarray(1);
+  const cleanup = () => {
+    input.destroy();
+    demuxer.close();
+    vPipe.off("drain", readFrame);
+    aPipe.off("drain", readFrame);
+    vPipe.end();
+    aPipe.end();
+    vbsf.forEach((e) => {
+      e.close();
+    });
+  };
 
-        const naluCount = buf.readUInt16BE();
-        buf = buf.subarray(2);
+  const vStream = demuxer.video();
+  const aStream = demuxer.audio();
 
-        for (let j = 0; j < naluCount; ++j) {
-            const naluLength = buf.readUInt16BE();
-            buf = buf.subarray(2);
+  let vInfo: VideoStreamInfo | undefined;
+  let aInfo: AudioStreamInfo | undefined;
+  const vPipe = new PassThrough({
+    objectMode: true,
+    writableHighWaterMark: 128,
+  });
+  const aPipe = new PassThrough({
+    objectMode: true,
+    writableHighWaterMark: 128,
+  });
 
-            const nalu = buf.subarray(0, naluLength);
-            buf = buf.subarray(naluLength);
-
-            if (naluType === H265NalUnitTypes.VPS_NUT)
-                vps.push(nalu);
-            else if (naluType === H265NalUnitTypes.SPS_NUT)
-                sps.push(nalu);
-            else if (naluType === H265NalUnitTypes.PPS_NUT)
-                pps.push(nalu);
-        }
+  const vbsf: BitStreamFilterAPI[] = [];
+  if (vStream) {
+    const codecId = vStream.codecpar.codecId;
+    if (!allowedVideoCodec.has(codecId)) {
+      const codecName = avGetCodecName(codecId);
+      cleanup();
+      throw new Error(`Video codec ${codecName} is not allowed`);
     }
-    return { vps, sps, pps }
-}
-
-function h264AddParamSets(frame: Buffer, paramSets: H264ParamSets) {
-    const { sps, pps } = paramSets;
-    const nalus = splitNalu(frame);
-    // Technically non-IDR I frames exist ("open GOP"), but they're exceedingly
-    // rare in the wild, and no encoder produces it by default
-    let isIDR = false;
-    let hasSPS = false;
-    let hasPPS = false;
-    for (const nalu of nalus) {
-        const naluType = H264Helpers.getUnitType(nalu);
-        if (naluType === H264NalUnitTypes.CodedSliceIdr)
-            isIDR = true;
-        else if (naluType === H264NalUnitTypes.SPS)
-            hasSPS = true;
-        else if (naluType === H264NalUnitTypes.PPS)
-            hasPPS = true;
+    try {
+      switch (codecId) {
+        case AVCodecID.AV_CODEC_ID_H264:
+          vbsf.push(BitStreamFilterAPI.create("h264_mp4toannexb", vStream));
+          vbsf.push(
+            BitStreamFilterAPI.create("h264_metadata", vStream, {
+              options: {
+                aud: "remove",
+              },
+            }),
+          );
+          vbsf.push(BitStreamFilterAPI.create("dump_extra", vStream));
+          break;
+        case AVCodecID.AV_CODEC_ID_HEVC:
+          vbsf.push(BitStreamFilterAPI.create("hevc_mp4toannexb", vStream));
+          vbsf.push(
+            BitStreamFilterAPI.create("hevc_metadata", vStream, {
+              options: {
+                aud: "remove",
+              },
+            }),
+          );
+          vbsf.push(BitStreamFilterAPI.create("dump_extra", vStream));
+          break;
+        default:
+          vbsf.push(BitStreamFilterAPI.create("null", vStream));
+          break;
+      }
+    } catch (e) {
+      cleanup();
+      throw new Error(`Failed to construct bitstream filterchain`, {
+        cause: (e as Error).cause,
+      });
     }
-    if (!isIDR) {
-        // Not an IDR, return as is
-        return frame;
-    }
-    const chunks = [];
-    if (!hasPPS)
-        chunks.push(...sps);
-    if (!hasSPS)
-        chunks.push(...pps);
-    return mergeNalu([...chunks, ...nalus]);
-}
 
-function h265AddParamSets(frame: Buffer, paramSets: H265ParamSets) {
-    const { vps, sps, pps } = paramSets;
-    const nalus = splitNalu(frame);
-    // Technically non-IDR I frames exist ("open GOP"), but they're exceedingly
-    // rare in the wild, and no encoder produces it by default
-    let isIDR = false;
-    let hasVPS = false;
-    let hasSPS = false;
-    let hasPPS = false;
-    for (const nalu of nalus) {
-        const naluType = H265Helpers.getUnitType(nalu);
-        if (naluType === H265NalUnitTypes.IDR_N_LP || naluType === H265NalUnitTypes.IDR_W_RADL)
-            isIDR = true;
-        else if (naluType === H265NalUnitTypes.VPS_NUT)
-            hasVPS = true;
-        else if (naluType === H265NalUnitTypes.SPS_NUT)
-            hasSPS = true;
-        else if (naluType === H265NalUnitTypes.PPS_NUT)
-            hasPPS = true;
-    }
-    if (!isIDR) {
-        // Not an IDR, return as is
-        return frame;
-    }
-    const chunks = [];
-    if (!hasVPS)
-        chunks.push(...vps);
-    if (!hasPPS)
-        chunks.push(...sps);
-    if (!hasSPS)
-        chunks.push(...pps);
-    return mergeNalu([...chunks, ...nalus]);
-}
-
-const idToStream = new Map<string, Readable>();
-const libavPromise = LibAV.LibAV();
-libavPromise.then((libav) => {
-    libav.onread = (id) => {
-        idToStream.get(id)?.resume();
-    }
-})
-
-export async function demux(input: Readable) {
-    const loggerInput = new Log("demux:input");
-    const loggerFormat = new Log("demux:format");
-    const loggerFrameCommon = new Log("demux:frame:common");
-    const loggerFrameVideo = new Log("demux:frame:video");
-    const loggerFrameAudio = new Log("demux:frame:audio");
-
-    const libav = await libavPromise;
-    const filename = uid();
-    await libav.mkreaderdev(filename);
-    idToStream.set(filename, input);
-
-    const ondata = (chunk: Buffer) => {
-        loggerInput.trace(`Received ${chunk.length} bytes of data for input ${filename}`);
-        libav.ff_reader_dev_send(filename, chunk)
+    const codecpar = vbsf.at(-1)?.outputCodecParameters ?? vStream.codecpar;
+    vInfo = {
+      index: vStream.index,
+      codec: codecId,
+      codecpar,
+      width: codecpar.width ?? 0,
+      height: codecpar.height ?? 0,
+      framerate_num: codecpar.frameRate.num,
+      framerate_den: codecpar.frameRate.den,
+      avStream: vStream,
     };
-    const onend = () => {
-        loggerInput.trace(`Reached the end of input ${filename}`);
-        libav.ff_reader_dev_send(filename, null);
+    loggerFormat.info(
+      {
+        info: vInfo,
+      },
+      `Found video stream in input ${filename}`,
+    );
+  }
+  if (aStream) {
+    const codecId = aStream.codecpar.codecId;
+    if (!allowedAudioCodec.has(codecId)) {
+      const codecName = avGetCodecName(codecId);
+      cleanup();
+      throw new Error(`Audio codec ${codecName} is not allowed`);
     }
-    input.on("data", ondata);
-    input.on("end", onend);
+    aInfo = {
+      index: aStream.index,
+      codec: codecId,
+      codecpar: aStream.codecpar,
+      sample_rate: aStream.codecpar.sampleRate || 0,
+      avStream: aStream,
+    };
+    loggerFormat.info(
+      {
+        info: aInfo,
+      },
+      `Found audio stream in input ${filename}`,
+    );
+  }
 
-    const [fmt_ctx, streams] = await libav.ff_init_demuxer_file(filename, "matroska");
-    const pkt = await libav.av_packet_alloc();
-
-    const cleanup = () => {
-        vPipe.off("drain", readFrame);
-        aPipe.off("drain", readFrame);
-        input.off("data", ondata);
-        input.off("end", onend);
-        idToStream.delete(filename);
-        libav.avformat_close_input_js(fmt_ctx);
-        libav.av_packet_free(pkt);
-        libav.unlink(filename);
+  const packetIterator = demuxer.packets();
+  const applyBitStreamFilters = async (
+    input: Packet | null,
+    filters: BitStreamFilterAPI[],
+  ) => {
+    let packets = [input];
+    for (const filter of filters) {
+      let newPackets: (Packet | null)[] = [];
+      for (const packet of packets) {
+        newPackets = [...newPackets, ...(await filter.filterAll(packet))];
+        packet?.free();
+      }
+      if (!input) newPackets.push(null);
+      packets = newPackets;
     }
-
-    const vStream = streams.find((stream) => stream.codec_type === libav.AVMEDIA_TYPE_VIDEO)
-    const aStream = streams.find((stream) => stream.codec_type === libav.AVMEDIA_TYPE_AUDIO)
-    let vInfo: VideoStreamInfo | undefined
-    let aInfo: AudioStreamInfo | undefined;
-    const vPipe = new PassThrough({ objectMode: true, highWaterMark: 128 });
-    const aPipe = new PassThrough({ objectMode: true, highWaterMark: 128 });
-
-    if (vStream) {
-        if (!allowedVideoCodec.has(vStream.codec_id)) {
-            const codecName = await libav.avcodec_get_name(vStream.codec_id);
-            cleanup();
-            throw new Error(`Video codec ${codecName} is not allowed`)
-        }
-        vInfo = {
-            index: vStream.index,
-            codec: vStream.codec_id,
-            width: await libav.AVCodecParameters_width(vStream.codecpar),
-            height: await libav.AVCodecParameters_height(vStream.codecpar),
-            framerate_num: await libav.AVCodecParameters_framerate_num(vStream.codecpar),
-            framerate_den: await libav.AVCodecParameters_framerate_den(vStream.codecpar),
-        }
-        if (vStream.codec_id === AVCodecID.AV_CODEC_ID_H264) {
-            const { extradata } = await libav.ff_copyout_codecpar(vStream.codecpar);
-            vInfo = {
-                ...vInfo,
-                // biome-ignore lint/style/noNonNullAssertion: will always be non-null for our use case
-                extradata: parseavcC(Buffer.from(extradata!))
+    return packets;
+  };
+  const readFrame = pDebounce.promise(async () => {
+    let resume = true;
+    while (resume) {
+      try {
+        const { value: inPacket, done } = await packetIterator.next();
+        if (done) {
+          loggerFrameCommon.info("Reached end of stream. Stopping");
+          const packets = await applyBitStreamFilters(null, vbsf);
+          for (const packet of packets) {
+            if (packet) vPipe.write(packet);
+          }
+          cleanup();
+          return;
+        } else if (inPacket) {
+          const streamIndex = inPacket.streamIndex;
+          if (vInfo && vInfo.index === streamIndex) {
+            loggerFrameVideo.trace("Received a video packet");
+            const packets = await applyBitStreamFilters(inPacket.clone(), vbsf);
+            for (const packet of packets) {
+              if (packet) resume &&= vPipe.write(packet);
             }
+          } else if (aInfo && aInfo.index === streamIndex) {
+            const packet = inPacket.clone()!;
+            packet.duration ||= BigInt(parseOpusPacketDuration(packet.data!));
+            resume &&= aPipe.write(packet);
+          }
+          inPacket.free();
         }
-        else if (vStream.codec_id === AVCodecID.AV_CODEC_ID_H265) {
-            const { extradata } = await libav.ff_copyout_codecpar(vStream.codecpar);
-            vInfo = {
-                ...vInfo,
-                // biome-ignore lint/style/noNonNullAssertion: will always be non-null for our use case
-                extradata: parsehvcC(Buffer.from(extradata!))
-            }
-        }
-        loggerFormat.info({
-            info: vInfo
-        }, `Found video stream in input ${filename}`)
+      } catch (e) {
+        loggerFrameCommon.info(
+          { error: e },
+          "Received an error during frame extraction. Stopping",
+        );
+        cleanup();
+        return;
+      }
     }
-    if (aStream) {
-        if (!allowedAudioCodec.has(aStream.codec_id)) {
-            const codecName = await libav.avcodec_get_name(aStream.codec_id);
-            cleanup();
-            throw new Error(`Audio codec ${codecName} is not allowed`);
-        }
-        aInfo = {
-            index: aStream.index,
-            codec: aStream.codec_id,
-            sample_rate: await libav.AVCodecParameters_sample_rate(aStream.codecpar),
-        }
-        loggerFormat.info({
-            info: aInfo
-        }, `Found audio stream in input ${filename}`)
-    }
-
-    const readFrame = pDebounce.promise(async () => {
-        let resume = true;
-        while (resume) {
-            const [status, streams] = await libav.ff_read_frame_multi(fmt_ctx, pkt, {
-                limit: 1,
-                unify: true
-            });
-            for (const packet of streams[0] ?? []) {
-                if (vInfo && vInfo.index === packet.stream_index) {
-                    if (vInfo.codec === AVCodecID.AV_CODEC_ID_H264) {
-                        packet.data = h264AddParamSets(
-                            Buffer.from(packet.data),
-                            // biome-ignore lint/style/noNonNullAssertion: will always be non-null for our use case
-                            vInfo.extradata! as H264ParamSets
-                        );
-                    }
-                    else if (vInfo.codec === AVCodecID.AV_CODEC_ID_H265) {
-                        packet.data = h265AddParamSets(
-                            Buffer.from(packet.data),
-                            // biome-ignore lint/style/noNonNullAssertion: will always be non-null for our use case
-                            vInfo.extradata! as H265ParamSets
-                        );
-                    }
-                    resume &&= vPipe.write(packet);
-                    loggerFrameVideo.trace("Pushed a frame into the video pipe");
-                }
-                else if (aInfo && aInfo.index === packet.stream_index) {
-                    resume &&= aPipe.write(packet);
-                    loggerFrameAudio.trace("Pushed a frame into the audio pipe");
-                }
-            }
-            if (status < 0 && status !== -libav.EAGAIN) {
-                // End of file, or some error happened
-                cleanup();
-                vPipe.end();
-                aPipe.end();
-                if (status === LibAV.AVERROR_EOF)
-                    loggerFrameCommon.info("Reached end of stream. Stopping");
-                else
-                    loggerFrameCommon.info({ status }, "Received an error during frame extraction. Stopping");
-                return;
-            }
-            if (!resume) {
-                input.pause();
-                loggerInput.trace("Input stream paused");
-            }
-        }
-    });
-    vPipe.on("drain", () => {
-        loggerFrameVideo.trace("Video pipe drained");
-        readFrame();
-    });
-    aPipe.on("drain", () => {
-        loggerFrameAudio.trace("Audio pipe drained");
-        readFrame();
-    });
+  });
+  vPipe.on("drain", () => {
+    loggerFrameVideo.trace("Video pipe drained");
     readFrame();
-    return {
-        video: vInfo ? { ...vInfo, stream: vPipe as Readable } : undefined,
-        audio: aInfo ? { ...aInfo, stream: aPipe as Readable } : undefined
-    }
+  });
+  aPipe.on("drain", () => {
+    loggerFrameAudio.trace("Audio pipe drained");
+    readFrame();
+  });
+  readFrame();
+  return {
+    video: vInfo ? { ...vInfo, stream: vPipe as Readable } : undefined,
+    audio: aInfo ? { ...aInfo, stream: aPipe as Readable } : undefined,
+  };
 }

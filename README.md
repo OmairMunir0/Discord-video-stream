@@ -1,13 +1,11 @@
 # Discord self-bot video
 
+[![pkg.pr.new](https://pkg.pr.new/badge/Discord-RE/Discord-video-stream)](https://pkg.pr.new/~/Discord-RE/Discord-video-stream)
+
 Fork: [Discord-video-experiment](https://github.com/mrjvs/Discord-video-experiment)
 
 > [!CAUTION]
 > Using any kind of automation programs on your account can result in your account getting permanently banned by Discord. Use at your own risk
-
-This project implements the custom Discord UDP protocol for sending media. Since Discord is likely change their custom protocol, this library is subject to break at any point. An effort will be made to keep this library up to date with the latest Discord protocol, but it is not guranteed.
-
-For better stability it is recommended to use WebRTC protocol instead since Discord is forced to adhere to spec, which means that the non-signaling portion of the code is guaranteed to work.
 
 ## Features
 
@@ -19,7 +17,7 @@ What I implemented and what I did not.
 
 ### Video codecs
 
-- [X] VP8
+- [ ] VP8 (once supported, removed for maintainability)
 - [ ] VP9
 - [X] H.264
 - [X] H.265
@@ -33,16 +31,16 @@ What I implemented and what I did not.
 ### Connection types
 
 - [X] Regular Voice Connection
-- [X] Go live
+- [X] Go Live
 
 ### Encryption
 
 - [X] Transport Encryption
-- [ ] [End-to-end Encryption](https://github.com/dank074/Discord-video-stream/issues/102)
+- [X] [End-to-end Encryption](https://github.com/dank074/Discord-video-stream/issues/102)
 
 ### Extras
 
-- [X] Figure out rtp header extensions (discord specific) (discord seems to use one-byte RTP header extension https://www.rfc-editor.org/rfc/rfc8285.html#section-4.2)
+- [X] Figure out RTP header extensions (discord specific) (discord seems to use [one-byte RTP header extension](https://www.rfc-editor.org/rfc/rfc8285.html#section-4.2))
 
 Extensions supported by Discord (taken from the webrtc sdp exchange)
 
@@ -63,9 +61,11 @@ Extensions supported by Discord (taken from the webrtc sdp exchange)
 
 ## Requirements
 
-Ffmpeg is required for the usage of this package. If you are on linux you can easily install ffmpeg from your distribution's package manager.
+For full functionality, this library requires an FFmpeg build with `libzmq` enabled. Here is our recommendation:
 
-If you are on Windows, you can download it from the official ffmpeg website: https://ffmpeg.org/download.html
+- Windows & Linux: [BtbN's FFmpeg Builds](https://github.com/BtbN/FFmpeg-Builds)
+- macOS (Intel): [evermeet.cx](https://evermeet.cx/ffmpeg/)
+- macOS (Apple Silicon): Install from Homebrew
 
 ## Usage
 
@@ -76,6 +76,9 @@ npm install @dank074/discord-video-stream@latest
 npm install discord.js-selfbot-v13@latest
 ```
 
+> [!IMPORTANT]
+> This library makes use of native dependencies (`node-av` and `node-datachannel`). If you use package managers that don't run install scripts by default (`pnpm`, `bun`, etc.), you'll need to allow running install scripts for `node-av` and `node-datachannel` for proper operation.
+
 Create a new Streamer, and pass it a selfbot Client
 
 ```typescript
@@ -84,7 +87,6 @@ import { Streamer } from '@dank074/discord-video-stream';
 
 const streamer = new Streamer(new Client());
 await streamer.client.login('TOKEN HERE');
-
 ```
 
 Make client join a voice channel
@@ -96,9 +98,21 @@ await streamer.joinVoice("GUILD ID HERE", "CHANNEL ID HERE");
 Start sending media
 
 ```typescript
-import { prepareStream, playStream, Utils } from "@dank074/discord-video-stream"
+import { prepareStream, playStream, Utils, Encoders } from "@dank074/discord-video-stream"
 try {
+    // NVENC is also available, change Encoders.software to Encoders.nvenc and
+    // adapt the settings
+    let encoder = Encoders.software({
+        x264: {
+            preset: "superfast"
+        },
+        x265: {
+            preset: "superfast"
+        }
+    });
     const { command, output } = prepareStream("DIRECT VIDEO URL OR READABLE STREAM HERE", {
+        encoder,
+
         // Specify either width or height for aspect ratio aware scaling
         // Specify both for stretched output
         height: 1080,
@@ -107,8 +121,7 @@ try {
         frameRate: 30,
         bitrateVideo: 5000,
         bitrateVideoMax: 7500,
-        videoCodec: Utils.normalizeVideoCodec("H264" /* or H265, VP9 */),
-        h26xPreset: "veryfast" // or superfast, ultrafast, ...
+        videoCodec: Utils.normalizeVideoCodec("H264" /* or H265 */),
     });
     command.on("error", (err, stdout, stderr) => {
         // Handle ffmpeg errors here
@@ -127,6 +140,11 @@ try {
 ## Encoder options available
 
 ```typescript
+/**
+ * A function returning encoder settings for a specific avg and max bitrate
+ * You can define your own, or use the pre-made functions in the library
+ */
+encoder: EncoderSettingsGetter;
 /**
  * Disable transcoding of the video stream. If specified, all video related
  * options have no effects
@@ -173,10 +191,6 @@ hardwareAcceleratedDecoding?: boolean;
  */
 videoCodec?: SupportedVideoCodec;
 /**
- * Encoding preset for H264 or H265. The faster it is, the lower the quality
- */
-h26xPreset?: 'ultrafast' | 'superfast' | 'veryfast' | 'faster' | 'fast' | 'medium' | 'slow' | 'slower' | 'veryslow';
-/**
  * Adds ffmpeg params to minimize latency and start outputting video as fast as possible.
  * Might create lag in video output in some rare cases
  */
@@ -184,7 +198,17 @@ minimizeLatency?: boolean;
 /**
  * Custom headers for HTTP requests
  */
-customHeaders?: Record<string, string>
+customHeaders?: Record<string, string>;
+/**
+   * Custom input options to pass directly to ffmpeg
+   * These will be added to the command *before* other options
+ */
+customInputOptions?: string[];
+/**
+ * Custom ffmpeg flags/options to pass directly to ffmpeg
+ * These will be added to the command *after* other options
+ */
+customFfmpegFlags?: string[];
 ```
 
 ## `playStream` options available
@@ -224,22 +248,6 @@ frameRate?: number,
 readrateInitialBurst?: number,
 ```
 
-## Streamer options available
-
-These control internal operations of the library, and can be changed through the `opts` property on the `Streamer` class. You probably shouldn't change it without a good reason
-
-```typescript
-/**
- * Enables sending RTCP sender reports. Helps the receiver synchronize the
- * audio/video frames, except in some weird cases which is why you can disable it
- */
-rtcpSenderReportEnabled?: boolean;
-/**
- * ChaCha20-Poly1305 Encryption is faster than AES-256-GCM, except when using AES-NI
- */
-forceChacha20Encryption?: boolean;
-```
-
 ## Performance tips
 
 See [this page](./PERFORMANCE.md) for some tips on improving performance
@@ -277,11 +285,11 @@ for example:
 $play-live http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4
 ```
 
-## FAQS
+## FAQs
 
 - Can I stream on existing voice connection (CAM) and in a go-live connection simultaneously?
 
-Yes, just send the media packets over both udp connections. The voice gateway expects you to signal when a user turns on their camera, so make sure you signal using `client.signalVideo(guildId, channelId, true)` before you start sending cam media packets.
+Yes, just send the media packets over both connections. The voice gateway expects you to signal when a user turns on their camera, so make sure you signal using `client.signalVideo(guildId, channelId, true)` before you start sending cam media packets.
 
 - Does this library work with bot tokens?
 
