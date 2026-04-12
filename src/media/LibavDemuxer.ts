@@ -94,9 +94,13 @@ function parseOpusPacketDuration(frame: Uint8Array) {
 
 type DemuxerOptions = {
   format: "matroska" | "nut";
+  audioStreamIndex?: number; // Audio stream index to select (0-based among audio streams)
 };
 
-export async function demux(input: Readable, { format }: DemuxerOptions) {
+export async function demux(
+  input: Readable,
+  { format, audioStreamIndex }: DemuxerOptions,
+) {
   const loggerFormat = new Log("demux:format");
   const loggerFrameCommon = new Log("demux:frame:common");
   const loggerFrameVideo = new Log("demux:frame:video");
@@ -124,7 +128,39 @@ export async function demux(input: Readable, { format }: DemuxerOptions) {
   };
 
   const vStream = demuxer.video();
-  const aStream = demuxer.audio();
+  let aStream: Stream | null = null;
+
+  if (audioStreamIndex !== undefined) {
+    // Select specific audio stream by index
+    const streams = demuxer.streams;
+    const audioStreams: Stream[] = [];
+    for (const stream of streams) {
+      if (stream.codecpar.codecType === 1) {
+        // AVMEDIA_TYPE_AUDIO = 1
+        audioStreams.push(stream);
+      }
+    }
+    if (audioStreamIndex >= 0 && audioStreamIndex < audioStreams.length) {
+      aStream = audioStreams[audioStreamIndex];
+      if (aStream) {
+        loggerFormat.info(
+          { index: audioStreamIndex, streamIndex: aStream.index },
+          `Selecting audio stream by index`,
+        );
+      }
+    } else {
+      loggerFormat.warn(
+        {
+          requestedIndex: audioStreamIndex,
+          availableCount: audioStreams.length,
+        },
+        `Invalid audio stream index, falling back to default`,
+      );
+      aStream = demuxer.audio() ?? null;
+    }
+  } else {
+    aStream = demuxer.audio() ?? null;
+  }
 
   let vInfo: VideoStreamInfo | undefined;
   let aInfo: AudioStreamInfo | undefined;

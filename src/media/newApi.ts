@@ -106,6 +106,12 @@ export type PrepareStreamOptions = {
   customFfmpegFlags: string[];
 
   /**
+   * Audio stream index to select (0-based among audio streams)
+   * If not specified, the first audio stream will be used
+   */
+  audioStreamIndex?: number;
+
+  /**
    * FFmpeg log level
    */
   logLevel:
@@ -155,6 +161,7 @@ export function prepareStream(
     },
     customInputOptions: [],
     customFfmpegFlags: [],
+    audioStreamIndex: undefined,
     logLevel: "verbose",
   } satisfies PrepareStreamOptions;
 
@@ -212,6 +219,8 @@ export function prepareStream(
 
       customFfmpegFlags:
         opts.customFfmpegFlags ?? defaultOptions.customFfmpegFlags,
+      audioStreamIndex:
+        opts.audioStreamIndex ?? defaultOptions.audioStreamIndex,
 
       logLevel: opts.logLevel ?? defaultOptions.logLevel,
     } satisfies PrepareStreamOptions;
@@ -330,10 +339,14 @@ export function prepareStream(
   }
 
   // audio setup
-  const { includeAudio, bitrateAudio } = mergedOptions;
+  const { includeAudio, bitrateAudio, audioStreamIndex } = mergedOptions;
   if (includeAudio)
     command
-      .outputOptions("-map 0:a:0?")
+      .outputOptions(
+        audioStreamIndex !== undefined
+          ? `-map 0:a:${audioStreamIndex}`
+          : "-map 0:a:0?",
+      )
       .audioChannels(2)
       /*
        * I don't have much surround sound material to test this with,
@@ -455,6 +468,12 @@ export type PlayStreamOptions = {
    * Enable stream preview from input stream (experimental)
    */
   streamPreview: boolean;
+
+  /**
+   * Audio stream index to select (0-based among audio streams)
+   * If not specified, the first audio stream will be used
+   */
+  audioStreamIndex?: number;
 };
 
 export async function playStream(
@@ -476,6 +495,7 @@ export async function playStream(
     frameRate: (video) => video.framerate_num / video.framerate_den,
     readrateInitialBurst: undefined,
     streamPreview: false,
+    audioStreamIndex: undefined,
   } satisfies PlayStreamOptions;
 
   function mergeOptions(opts: Partial<PlayStreamOptions>) {
@@ -509,6 +529,9 @@ export async function playStream(
           : defaultOptions.readrateInitialBurst,
 
       streamPreview: opts.streamPreview ?? defaultOptions.streamPreview,
+
+      audioStreamIndex:
+        opts.audioStreamIndex ?? defaultOptions.audioStreamIndex,
     } satisfies PlayStreamOptions;
   }
 
@@ -518,6 +541,7 @@ export async function playStream(
   logger.debug("Initializing demuxer");
   const { video, audio } = await demux(input, {
     format: mergedOptions.format,
+    audioStreamIndex: mergedOptions.audioStreamIndex,
   });
   cancelSignal?.throwIfAborted();
 
