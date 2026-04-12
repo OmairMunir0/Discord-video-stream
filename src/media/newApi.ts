@@ -636,7 +636,6 @@ export async function playStream(
           .resize(1024, 576, { fit: "inside" })
           .jpeg()
           .toBuffer()
-          .then((image) => streamer.setStreamPreview(image))
           .catch(() => {})
           .finally(() => {
             frames.forEach((frame) => {

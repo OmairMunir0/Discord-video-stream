@@ -2,10 +2,15 @@ import { EventEmitter } from "node:events";
 import { VoiceConnection } from "./voice/VoiceConnection.js";
 import { StreamConnection } from "./voice/StreamConnection.js";
 import { GatewayOpCodes } from "./GatewayOpCodes.js";
-import type TypedEmitter from "typed-emitter";
-import type { Client } from "discord.js-selfbot-v13";
-import type { MediaUdp } from "./voice/MediaUdp.js";
-import type { GatewayEvent } from "./GatewayEvents.js";
+import type {
+  Client,
+  DMChannel,
+  GroupDMChannel,
+  VoiceBasedChannel,
+} from "discord.js-selfbot-v13";
+import type { GatewayEvent, GatewayEventMap } from "./GatewayEvents.js";
+import type { WebRtcConnWrapper } from "./voice/WebRtcWrapper.js";
+import { generateStreamKey, parseStreamKey } from "../utils.js";
 
 type EmitterEvents = {
   [K in GatewayEvent["t"]]: (
